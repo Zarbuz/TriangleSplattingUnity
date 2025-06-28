@@ -1,167 +1,144 @@
-using System.Collections;
-using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using UnityEngine;
 
-public class TriangleSplatRenderer : MonoBehaviour
+namespace TriangleSplattingUnity.Runtime
 {
-    [Header("OFF File")]
-    public string coffFilePath = "Assets/Models/your_model.off";
-    public Material triangleMaterial;
+	public class TriangleSplatOctreeRenderer : MonoBehaviour
+	{
+		public string coffFilePath;
+		public Shader shader;
+		public ComputeShader cullingCompute;
+		public uint maxTriangleInstances = 500_000;
 
-    [Header("Chunking")]
-    public float chunkSize = 5f;
-    public int maxTrianglesPerChunk = 10000;
+		private ComputeBuffer v0Buffer, v1Buffer, v2Buffer, colorBuffer;
+		private ComputeBuffer visibleIndexBuffer, argsBuffer;
+		private Material material;
+		private Mesh triangleMesh;
 
-    [Header("Culling")]
-    public float cullingDistance = 50f;
-    public float updateInterval = 0.5f;
+		private Camera cam;
+		private int kernel;
 
-    private List<GameObject> chunks = new List<GameObject>();
-    private Camera mainCamera;
-    public bool GenerateColliders = false;
-    public Vector3 InitRotation = new Vector3(151, 0, 0);
-    void Start()
-    {
-        mainCamera = Camera.main;
-        StartCoroutine(LoadCOFFInChunks());
-        StartCoroutine(UpdateChunkVisibility());
-    }
+		private void Start()
+		{
+			cam = Camera.main;
+			material = new Material(shader);
+			kernel = cullingCompute.FindKernel("CSMain");
+			LoadAndInit();
+		}
 
-    IEnumerator LoadCOFFInChunks()
-    {
-        if (!File.Exists(coffFilePath))
-        {
-            Debug.LogError("OFF File Not Found : " + coffFilePath);
-            yield break;
-        }
+		void LoadAndInit()
+		{
+			string[] lines = File.ReadAllLines(coffFilePath);
+			if (!lines[0].StartsWith("COFF")) return;
 
-        string[] lines = File.ReadAllLines(coffFilePath);
-        if (!lines[0].Trim().StartsWith("COFF"))
-        {
-            Debug.LogError("COFF Invalid");
-            yield break;
-        }
+			int vertexCount = int.Parse(lines[1].Split()[0]);
+			int faceCount = int.Parse(lines[1].Split()[1]);
 
-        string[] counts = lines[1].Split();
-        int vertexCount = int.Parse(counts[0]);
-        int faceCount = int.Parse(counts[1]);
+			Vector3[] verts = new Vector3[vertexCount];
+			for (int i = 0; i < vertexCount; i++)
+			{
+				var p = lines[2 + i].Split();
+				verts[i] = new Vector3(
+					float.Parse(p[0], CultureInfo.InvariantCulture),
+					float.Parse(p[1], CultureInfo.InvariantCulture),
+					float.Parse(p[2], CultureInfo.InvariantCulture)
+				);
+			}
 
-        List<Vector3> originalVertices = new List<Vector3>();
-        for (int i = 0; i < vertexCount; i++)
-        {
-            string[] parts = lines[2 + i].Split();
-            float x = float.Parse(parts[0], CultureInfo.InvariantCulture);
-            float y = float.Parse(parts[1], CultureInfo.InvariantCulture);
-            float z = float.Parse(parts[2], CultureInfo.InvariantCulture);
-            originalVertices.Add(new Vector3(x, y, z));
-        }
+			var v0s = new Vector3[faceCount];
+			var v1s = new Vector3[faceCount];
+			var v2s = new Vector3[faceCount];
+			var colors = new Color[faceCount];
 
-        Dictionary<Vector3Int, List<(Vector3, Vector3, Vector3, Color)>> chunkMap = new();
+			int count = 0;
+			for (int i = 0; i < faceCount; i++)
+			{
+				var p = lines[2 + vertexCount + i].Split();
+				if (p[0] != "3") continue;
 
-        for (int i = 0; i < faceCount; i++)
-        {
-            string[] parts = lines[2 + vertexCount + i].Split();
-            if (int.Parse(parts[0]) != 3) continue;
+				int i0 = int.Parse(p[1]);
+				int i1 = int.Parse(p[2]);
+				int i2 = int.Parse(p[3]);
 
-            int i0 = int.Parse(parts[1]);
-            int i1 = int.Parse(parts[2]);
-            int i2 = int.Parse(parts[3]);
+				v0s[count] = verts[i0];
+				v1s[count] = verts[i1];
+				v2s[count] = verts[i2];
 
-            float r = float.Parse(parts[4]) / 255f;
-            float g = float.Parse(parts[5]) / 255f;
-            float b = float.Parse(parts[6]) / 255f;
-            float a = float.Parse(parts[7]) / 255f;
-            Color faceColor = new Color(r, g, b, a);
+				colors[count] = new Color(
+					float.Parse(p[4]) / 255f,
+					float.Parse(p[5]) / 255f,
+					float.Parse(p[6]) / 255f,
+					float.Parse(p[7]) / 255f
+				);
 
-            Vector3 v0 = originalVertices[i0];
-            Vector3 v1 = originalVertices[i1];
-            Vector3 v2 = originalVertices[i2];
+				count++;
+			}
 
-            Vector3 center = (v0 + v1 + v2) / 3f;
-            Vector3Int chunkCoord = new Vector3Int(
-                Mathf.FloorToInt(center.x / chunkSize),
-                Mathf.FloorToInt(center.y / chunkSize),
-                Mathf.FloorToInt(center.z / chunkSize)
-            );
+			v0Buffer = new ComputeBuffer(count, sizeof(float) * 3);
+			v1Buffer = new ComputeBuffer(count, sizeof(float) * 3);
+			v2Buffer = new ComputeBuffer(count, sizeof(float) * 3);
+			colorBuffer = new ComputeBuffer(count, sizeof(float) * 4);
+			visibleIndexBuffer = new ComputeBuffer((int)maxTriangleInstances, sizeof(uint), ComputeBufferType.Append);
+			argsBuffer = new ComputeBuffer(1, 5 * sizeof(uint), ComputeBufferType.IndirectArguments);
 
-            if (!chunkMap.ContainsKey(chunkCoord))
-                chunkMap[chunkCoord] = new List<(Vector3, Vector3, Vector3, Color)>();
+			v0Buffer.SetData(v0s);
+			v1Buffer.SetData(v1s);
+			v2Buffer.SetData(v2s);
+			colorBuffer.SetData(colors);
+			argsBuffer.SetData(new uint[] { 3, maxTriangleInstances, 0, 0, 0 });
 
-            chunkMap[chunkCoord].Add((v0, v1, v2, faceColor));
+			material.SetBuffer("_Vertices0", v0Buffer);
+			material.SetBuffer("_Vertices1", v1Buffer);
+			material.SetBuffer("_Vertices2", v2Buffer);
+			material.SetBuffer("_Colors", colorBuffer);
+			material.SetBuffer("_VisibleIndices", visibleIndexBuffer);
+		}
 
-            if (i % 10000 == 0)
-            {
-                float progress = (float)i / faceCount * 100f;
-                Debug.Log($"Loading COFF : {progress:F1}% ({i}/{faceCount} faces)");
-                yield return null;
-            }
-        }
+		void Update()
+		{
+			if (v0Buffer == null) return;
 
-        foreach (var kvp in chunkMap)
-        {
-            GameObject chunk = new GameObject($"Chunk_{kvp.Key}");
-            chunk.transform.parent = this.transform;
+			Matrix4x4 VP = cam.projectionMatrix * cam.worldToCameraMatrix;
+			visibleIndexBuffer.SetCounterValue(0);
 
-            List<Vector3> verts = new();
-            List<Color> colors = new();
-            List<int> tris = new();
+			cullingCompute.SetMatrix("_VPMatrix", VP);
+			cullingCompute.SetBuffer(kernel, "_V0", v0Buffer);
+			cullingCompute.SetBuffer(kernel, "_V1", v1Buffer);
+			cullingCompute.SetBuffer(kernel, "_V2", v2Buffer);
+			cullingCompute.SetBuffer(kernel, "_VisibleIndices", visibleIndexBuffer);
+			cullingCompute.Dispatch(kernel, Mathf.CeilToInt(v0Buffer.count / 64f), 1, 1);
 
-            foreach (var (v0, v1, v2, col) in kvp.Value)
-            {
-                int baseIndex = verts.Count;
-                verts.Add(v0); verts.Add(v1); verts.Add(v2);
-                colors.Add(col); colors.Add(col); colors.Add(col);
-                tris.Add(baseIndex); tris.Add(baseIndex + 1); tris.Add(baseIndex + 2);
-            }
+			Graphics.DrawMeshInstancedIndirect(
+				triangleMesh ??= CreateTriangleMesh(),
+				0,
+				material,
+				new Bounds(Vector3.zero, Vector3.one * 10000f),
+				argsBuffer
+			);
+		}
 
-            Mesh mesh = new Mesh();
-            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-            mesh.SetVertices(verts);
-            mesh.SetTriangles(tris, 0);
-            mesh.SetColors(colors);
-            mesh.RecalculateNormals();
+		Mesh CreateTriangleMesh()
+		{
+			var mesh = new Mesh();
+			mesh.vertices = new[]
+			{
+				Vector3.zero,
+				Vector3.right,
+				Vector3.up
+			};
+			mesh.triangles = new[] { 0, 1, 2 };
+			return mesh;
+		}
 
-            var mf = chunk.AddComponent<MeshFilter>();
-            var mr = chunk.AddComponent<MeshRenderer>();
-            mf.mesh = mesh;
-            mr.material = triangleMaterial;
-
-            chunks.Add(chunk);
-            if (GenerateColliders)
-                chunk.AddComponent<MeshCollider>();
-        }
-
-        Debug.Log($"Loading ended : {chunks.Count} chunks created.");
-        this.transform.localEulerAngles = InitRotation;
-    }
-
-    IEnumerator UpdateChunkVisibility()
-    {
-        while (true)
-        {
-            if (mainCamera == null)
-                mainCamera = Camera.main;
-
-            Plane[] frustumPlanes = GeometryUtility.CalculateFrustumPlanes(mainCamera);
-
-            foreach (var chunk in chunks)
-            {
-
-                Renderer renderer = chunk.GetComponentInChildren<Renderer>();
-                if (renderer != null)
-                {
-                    Bounds worldBounds = renderer.bounds;
-                    bool isVisible = GeometryUtility.TestPlanesAABB(frustumPlanes, worldBounds);
-                    float distance = Vector3.Distance(mainCamera.transform.position, worldBounds.center);
-                    chunk.SetActive(isVisible && distance < cullingDistance);
-                }
-
-            }
-
-            yield return new WaitForSeconds(updateInterval);
-        }
-    }
-
+		private void OnDestroy()
+		{
+			v0Buffer?.Dispose();
+			v1Buffer?.Dispose();
+			v2Buffer?.Dispose();
+			colorBuffer?.Dispose();
+			visibleIndexBuffer?.Dispose();
+			argsBuffer?.Dispose();
+		}
+	}
 }

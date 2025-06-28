@@ -1,0 +1,22 @@
+#pragma kernel CSMain
+
+StructuredBuffer<float3> _V0;
+StructuredBuffer<float3> _V1;
+StructuredBuffer<float3> _V2;
+AppendStructuredBuffer<uint> _VisibleIndices;
+
+float4x4 _VPMatrix;
+
+[numthreads(64, 1, 1)]
+void CSMain(uint id : SV_DispatchThreadID)
+{
+    if (id >= _V0.Length) return;
+
+    float3 center = (_V0[id] + _V1[id] + _V2[id]) / 3.0f;
+
+    float4 clip = mul(_VPMatrix, float4(center, 1));
+    clip.xyz /= clip.w;
+
+    if (all(abs(clip.xyz) <= 1))
+        _VisibleIndices.Append(id);
+}
